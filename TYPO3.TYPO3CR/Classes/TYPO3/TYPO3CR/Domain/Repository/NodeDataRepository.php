@@ -57,14 +57,14 @@ class NodeDataRepository extends Repository
     const INDEX_MAXIMUM = 2147483647;
 
     /**
-     * @var \SplObjectStorage
+     * @var array<\SplObjectStorage>
      */
-    protected $addedNodes;
+    protected $addedNodes = [];
 
     /**
-     * @var \SplObjectStorage
+     * @var array<\SplObjectStorage>
      */
-    protected $removedNodes;
+    protected $removedNodes = [];
 
     /**
      * Doctrine's Entity Manager. Note that "ObjectManager" is the name of the related
@@ -116,8 +116,6 @@ class NodeDataRepository extends Repository
      */
     public function __construct()
     {
-        $this->addedNodes = new \SplObjectStorage();
-        $this->removedNodes = new \SplObjectStorage();
         parent::__construct();
     }
 
@@ -133,11 +131,17 @@ class NodeDataRepository extends Repository
      */
     public function add($object)
     {
-        if ($this->removedNodes->contains($object)) {
-            $this->removedNodes->detach($object);
+        /** @var NodeData $object */
+        if (isset($this->removedNodes[$object->getIdentifier()])) {
+            if ($this->removedNodes[$object->getIdentifier()]->contains($object)) {
+                $this->removedNodes[$object->getIdentifier()]->detach($object);
+            }
         }
-        if (!$this->addedNodes->contains($object)) {
-            $this->addedNodes->attach($object);
+        if (!isset($this->addedNodes[$object->getIdentifier()])) {
+            $this->addedNodes[$object->getIdentifier()] = new \SplObjectStorage();
+        }
+        if (!$this->addedNodes[$object->getIdentifier()]->contains($object)) {
+            $this->addedNodes[$object->getIdentifier()]->attach($object);
         }
         parent::add($object);
     }
@@ -157,11 +161,16 @@ class NodeDataRepository extends Repository
         if ($object instanceof NodeInterface) {
             $object = $object->getNodeData();
         }
-        if ($this->addedNodes->contains($object)) {
-            $this->addedNodes->detach($object);
+        if (isset($this->addedNodes[$object->getIdentifier()])) {
+            if ($this->addedNodes[$object->getIdentifier()]->contains($object)) {
+                $this->addedNodes[$object->getIdentifier()]->detach($object);
+            }
         }
-        if (!$this->removedNodes->contains($object)) {
-            $this->removedNodes->attach($object);
+        if (!isset($this->removedNodes[$object->getIdentifier()])) {
+            $this->removedNodes[$object->getIdentifier()] = new \SplObjectStorage();
+        }
+        if (!$this->removedNodes[$object->getIdentifier()]->contains($object)) {
+            $this->removedNodes[$object->getIdentifier()]->attach($object);
         }
         parent::remove($object);
     }
@@ -257,11 +266,13 @@ class NodeDataRepository extends Repository
         $addedNodes = [];
         $workspaces = [];
         while ($workspace !== null) {
-            /** @var $node NodeData */
-            foreach ($this->addedNodes as $node) {
-                if (($node->getPath() === $path && $node->matchesWorkspaceAndDimensions($workspace, $dimensions)) && ($onlyShadowNodes === false || $node->isInternal())) {
-                    $addedNodes[] = $node;
-                    // removed nodes don't matter here because due to the identity map the right object will be returned from the query and will have "removed" set.
+            foreach ($this->addedNodes as $nodeVariants) {
+                /** @var $node NodeData */
+                foreach ($nodeVariants as $node) {
+                    if (($node->getPath() === $path && $node->matchesWorkspaceAndDimensions($workspace, $dimensions)) && ($onlyShadowNodes === false || $node->isInternal())) {
+                        $addedNodes[] = $node;
+                        // removed nodes don't matter here because due to the identity map the right object will be returned from the query and will have "removed" set.
+                    }
                 }
             }
 
@@ -326,17 +337,21 @@ class NodeDataRepository extends Repository
     {
         $workspaces = [];
         while ($workspace !== null) {
-            /** @var $node NodeData */
-            foreach ($this->addedNodes as $node) {
-                if ($node->getIdentifier() === $identifier && $node->matchesWorkspaceAndDimensions($workspace, $dimensions)) {
-                    return $node;
+            if (isset($this->addedNodes[$identifier])) {
+                /** @var $node NodeData */
+                foreach ($this->addedNodes[$identifier] as $node) {
+                    if ($node->matchesWorkspaceAndDimensions($workspace, $dimensions)) {
+                        return $node;
+                    }
                 }
             }
 
-            /** @var $node NodeData */
-            foreach ($this->removedNodes as $node) {
-                if ($node->getIdentifier() === $identifier && $node->matchesWorkspaceAndDimensions($workspace, $dimensions)) {
-                    return null;
+            if (isset($this->removedNodes[$identifier])) {
+                /** @var $node NodeData */
+                foreach ($this->removedNodes[$identifier] as $node) {
+                    if ($node->matchesWorkspaceAndDimensions($workspace, $dimensions)) {
+                        return null;
+                    }
                 }
             }
 
@@ -345,11 +360,6 @@ class NodeDataRepository extends Repository
         }
 
         $queryBuilder = $this->createQueryBuilder($workspaces);
-        if ($removedNodes === false) {
-            $queryBuilder->andWhere('n.movedTo IS NULL OR n.removed = FALSE');
-        } else {
-            $queryBuilder->andWhere('n.movedTo IS NULL');
-        }
         if ($dimensions !== null) {
             $this->addDimensionJoinConstraintsToQueryBuilder($queryBuilder, $dimensions);
         } else {
@@ -496,39 +506,43 @@ class NodeDataRepository extends Repository
 
         $childNodeDepth = NodePaths::getPathDepth($parentPath) + 1;
         $constraints = $nodeTypeFilter !== '' ? $this->getNodeTypeFilterConstraintsForDql($nodeTypeFilter) : array();
-        /** @var $addedNode NodeData */
-        foreach ($this->addedNodes as $addedNode) {
-            if (
-                (($recursive && $addedNode->getDepth() >= $childNodeDepth) || $addedNode->getDepth() === $childNodeDepth) &&
-                (($recursive && NodePaths::isSubPathOf($addedNode->getPath(), $parentPath)) || NodePaths::getParentPath($addedNode->getPath()) === $parentPath) &&
-                $addedNode->matchesWorkspaceAndDimensions($workspace, $dimensions)
-            ) {
-                $nodeType = $addedNode->getNodeType();
-                $disallowed = false;
-                foreach ($constraints['includeNodeTypes'] as $includeNodeType) {
-                    if (!$nodeType->isOfType($includeNodeType)) {
-                        $disallowed = true;
+        foreach ($this->addedNodes as $nodeVariants) {
+            /** @var $addedNode NodeData */
+            foreach ($nodeVariants as $addedNode) {
+                if (
+                    (($recursive && $addedNode->getDepth() >= $childNodeDepth) || $addedNode->getDepth() === $childNodeDepth) &&
+                    (($recursive && NodePaths::isSubPathOf($addedNode->getPath(), $parentPath)) || NodePaths::getParentPath($addedNode->getPath()) === $parentPath) &&
+                    $addedNode->matchesWorkspaceAndDimensions($workspace, $dimensions)
+                ) {
+                    $nodeType = $addedNode->getNodeType();
+                    $disallowed = false;
+                    foreach ($constraints['includeNodeTypes'] as $includeNodeType) {
+                        if (!$nodeType->isOfType($includeNodeType)) {
+                            $disallowed = true;
+                        }
                     }
-                }
-                foreach ($constraints['excludeNodeTypes'] as $excludeNodeTypes) {
-                    if ($nodeType->isOfType($excludeNodeTypes)) {
-                        $disallowed = true;
+                    foreach ($constraints['excludeNodeTypes'] as $excludeNodeTypes) {
+                        if ($nodeType->isOfType($excludeNodeTypes)) {
+                            $disallowed = true;
+                        }
                     }
-                }
-                if ($disallowed === false) {
-                    $foundNodes[$addedNode->getIdentifier()] = $addedNode;
+                    if ($disallowed === false) {
+                        $foundNodes[$addedNode->getIdentifier()] = $addedNode;
+                    }
                 }
             }
         }
-        /** @var $removedNode NodeData */
-        foreach ($this->removedNodes as $removedNode) {
-            if (
-                (($recursive && $removedNode->getDepth() >= $childNodeDepth) || $removedNode->getDepth() === $childNodeDepth) &&
-                (($recursive && NodePaths::isSubPathOf($removedNode->getPath(), $parentPath)) || NodePaths::getParentPath($removedNode->getPath()) === $parentPath) &&
-                $removedNode->matchesWorkspaceAndDimensions($workspace, $dimensions)
-            ) {
-                if (isset($foundNodes[$removedNode->getIdentifier()])) {
-                    unset($foundNodes[$removedNode->getIdentifier()]);
+        foreach ($this->removedNodes as $nodeVariants) {
+            /** @var $removedNode NodeData */
+            foreach ($nodeVariants as $removedNode) {
+                if (
+                    (($recursive && $removedNode->getDepth() >= $childNodeDepth) || $removedNode->getDepth() === $childNodeDepth) &&
+                    (($recursive && NodePaths::isSubPathOf($removedNode->getPath(), $parentPath)) || NodePaths::getParentPath($removedNode->getPath()) === $parentPath) &&
+                    $removedNode->matchesWorkspaceAndDimensions($workspace, $dimensions)
+                ) {
+                    if (isset($foundNodes[$removedNode->getIdentifier()])) {
+                        unset($foundNodes[$removedNode->getIdentifier()]);
+                    }
                 }
             }
         }
@@ -599,18 +613,22 @@ class NodeDataRepository extends Repository
         $foundNodes = $query->getResult();
 
         $childNodeDepth = NodePaths::getPathDepth($parentPath) + 1;
-        /** @var $addedNode NodeData */
-        foreach ($this->addedNodes as $addedNode) {
-            if ($addedNode->getDepth() === $childNodeDepth && NodePaths::getParentPath($addedNode->getPath()) === $parentPath && in_array($addedNode->getWorkspace(), $workspaces)) {
-                $foundNodes[] = $addedNode;
+        foreach ($this->addedNodes as $nodeVariants) {
+            /** @var $addedNode NodeData */
+            foreach ($nodeVariants as $addedNode) {
+                if ($addedNode->getDepth() === $childNodeDepth && NodePaths::getParentPath($addedNode->getPath()) === $parentPath && in_array($addedNode->getWorkspace(), $workspaces)) {
+                    $foundNodes[] = $addedNode;
+                }
             }
         }
-        /** @var $removedNode NodeData */
-        foreach ($this->removedNodes as $removedNode) {
-            if ($removedNode->getDepth() === $childNodeDepth && NodePaths::getParentPath($removedNode->getPath()) === $parentPath && in_array($removedNode->getWorkspace(), $workspaces)) {
-                $foundNodes = array_filter($foundNodes, function ($nodeData) use ($removedNode) {
-                    return $nodeData !== $removedNode;
-                });
+        foreach ($this->removedNodes as $nodeVariants) {
+            /** @var $removedNode NodeData */
+            foreach ($nodeVariants as $removedNode) {
+                if ($removedNode->getDepth() === $childNodeDepth && NodePaths::getParentPath($removedNode->getPath()) === $parentPath && in_array($removedNode->getWorkspace(), $workspaces)) {
+                    $foundNodes = array_filter($foundNodes, function ($nodeData) use ($removedNode) {
+                        return $nodeData !== $removedNode;
+                    });
+                }
             }
         }
 
@@ -708,13 +726,15 @@ class NodeDataRepository extends Repository
         }
 
         /** @var $node NodeData */
-        foreach ($this->addedNodes as $node) {
-            if ($node->getParentPath() === $parentPath) {
-                $nodesOnLevel[] = [
-                    'addedNode' => $node,
-                    'path' => $node->getPath(),
-                    'index' => $node->getIndex()
-                ];
+        foreach ($this->addedNodes as $nodeVariants) {
+            foreach ($nodeVariants as $node) {
+                if ($node->getParentPath() === $parentPath) {
+                    $nodesOnLevel[] = [
+                        'addedNode' => $node,
+                        'path' => $node->getPath(),
+                        'index' => $node->getIndex()
+                    ];
+                }
             }
         }
 
@@ -833,9 +853,11 @@ class NodeDataRepository extends Repository
 
         $nodesInMemory = 0;
         /** @var $node NodeData */
-        foreach ($this->addedNodes as $node) {
-            if ($node->getWorkspace()->getName() === $workspace->getName()) {
-                $nodesInMemory++;
+        foreach ($this->addedNodes as $nodeVariants) {
+            foreach ($nodeVariants as $node) {
+                if ($node->getWorkspace()->getName() === $workspace->getName()) {
+                    $nodesInMemory++;
+                }
             }
         }
 
@@ -1042,8 +1064,8 @@ class NodeDataRepository extends Repository
     public function flushNodeRegistry()
     {
         $this->highestIndexCache = [];
-        $this->addedNodes = new \SplObjectStorage();
-        $this->removedNodes = new \SplObjectStorage();
+        $this->addedNodes = [];
+        $this->removedNodes = [];
     }
 
     /**
@@ -1155,8 +1177,10 @@ class NodeDataRepository extends Repository
     protected function filterOutRemovedObjects(array &$objects)
     {
         foreach ($objects as $index => $object) {
-            if ($this->removedNodes->contains($object)) {
-                unset($objects[$index]);
+            if ($object instanceof NodeData && isset($this->removedNodes[$object->getIdentifier()])) {
+                if ($this->removedNodes[$object->getIdentifier()]->contains($object)) {
+                    unset($objects[$index]);
+                }
             }
         }
     }
@@ -1420,9 +1444,11 @@ class NodeDataRepository extends Repository
         $query = $queryBuilder->getQuery();
         $foundNodes = $query->getResult();
         // Consider materialized, but not yet persisted nodes
-        foreach ($this->addedNodes as $addedNode) {
-            if (($addedNode->getPath() === $path || ($recursive && NodePaths::isSubPathOf($path, $addedNode->getPath()))) && in_array($addedNode->getWorkspace(), $workspaces)) {
-                $foundNodes[] = $addedNode;
+        foreach ($this->addedNodes as $nodeVariants) {
+            foreach ($nodeVariants as $addedNode) {
+                if (($addedNode->getPath() === $path || ($recursive && NodePaths::isSubPathOf($path, $addedNode->getPath()))) && in_array($addedNode->getWorkspace(), $workspaces)) {
+                    $foundNodes[] = $addedNode;
+                }
             }
         }
 
@@ -1494,7 +1520,8 @@ class NodeDataRepository extends Repository
      */
     public function isInRemovedNodes(NodeData $nodeData)
     {
-        return $this->removedNodes->contains($nodeData);
+        return isset($this->removedNodes[$nodeData->getIdentifier()])
+            && $this->removedNodes[$nodeData->getIdentifier()]->contains($nodeData);
     }
 
     /**
@@ -1584,15 +1611,17 @@ class NodeDataRepository extends Repository
         /** @var NodeData $nodeData */
         foreach ($nodeDataObjects as $nodeData) {
             $nodeIdentifier[] = $nodeData->getIdentifier();
-            while ($workspace !== null) {
-                /** @var $node NodeData */
-                foreach ($this->addedNodes as $node) {
-                    if ($node->getIdentifier() === $nodeData->getIdentifier() && $node->matchesWorkspaceAndDimensions($workspace, $dimensions) && $node->isInternal() === false) {
-                        $nonPersistedNodes[] = $node;
+            if (isset($this->addedNodes[$nodeData->getIdentifier()])) {
+                while ($workspace !== null) {
+                    /** @var $node NodeData */
+                    foreach ($this->addedNodes[$nodeData->getIdentifier()] as $node) {
+                        if ($node->matchesWorkspaceAndDimensions($workspace, $dimensions) && $node->isInternal() === false) {
+                            $nonPersistedNodes[] = $node;
+                        }
                     }
-                }
 
-                $workspace = $workspace->getBaseWorkspace();
+                    $workspace = $workspace->getBaseWorkspace();
+                }
             }
         }
 
